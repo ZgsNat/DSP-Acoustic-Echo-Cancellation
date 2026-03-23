@@ -1,0 +1,5 @@
+# core
+numpy
+pandas
+scipy
+pytest
