@@ -3,3 +3,5 @@ numpy
 pandas
 scipy
 pytest
+librosa
+matplotlib
