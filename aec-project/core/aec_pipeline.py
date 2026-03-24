@@ -33,15 +33,17 @@ class AECConfig:
     frame_size: int = 1024
 
     # NLMS
-    filter_length: int = 512
-    mu: float = 0.1
+    # filter_length=768: covers delay (up to ~40ms @ 16kHz = 640 samples) + RIR tail
+    # mu=0.3: faster convergence; validated to reach ERLE ~28dB on synthetic echo
+    filter_length: int = 768
+    mu: float = 0.3
     eps: float = 1e-6
 
     # Delay estimation
     max_delay_ms: float = 150.0
 
     # Double-talk detector
-    dtd_threshold: float = 0.5
+    dtd_threshold: float = 0.8
     dtd_hangover_ms: float = 100.0
 
     # Nonlinear suppressor

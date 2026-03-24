@@ -6,3 +6,4 @@ pytest
 librosa
 matplotlib
 sounddevice 
+pyaudio
