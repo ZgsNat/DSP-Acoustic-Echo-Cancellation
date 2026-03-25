@@ -19,9 +19,16 @@ Where:
     L     : filter length (determines how long an echo we can cancel)
 """
 
-import numpy as np
-from dataclasses import dataclass, field
+# ==========================================
+# FILE 2: nlms_filter.py
+# ==========================================
+"""
+NLMS Adaptive Filter — Core of AEC
+(Đã sửa nút thắt cổ chai bằng cách Vectorize mảng trượt)
+"""
 
+import numpy as np
+from dataclasses import dataclass
 
 @dataclass
 class NLMSConfig:
@@ -40,7 +47,6 @@ class NLMSConfig:
     # Regularization to avoid division by zero during silence.
     eps: float = 1e-6
 
-
 class NLMSFilter:
     """
     Single-channel NLMS adaptive filter for Acoustic Echo Cancellation.
@@ -58,10 +64,10 @@ class NLMSFilter:
 
         # Filter weights — start at zero (assumes no echo initially)
         self.w: np.ndarray = np.zeros(L, dtype=np.float64)
-
-        # Circular buffer holding last L samples of reference signal
-        self._ref_buf: np.ndarray = np.zeros(L, dtype=np.float64)
-        self._buf_idx: int = 0  # Next write position in circular buffer
+        
+        # --- SỬA LỖI 2: Dùng buffer tuyến tính thay vì circular buffer thủ công ---
+        # Chỉ lưu lịch sử L-1 mẫu của frame trước đó
+        self._history: np.ndarray = np.zeros(L - 1, dtype=np.float64)
 
     def process(
         self,
@@ -69,21 +75,6 @@ class NLMSFilter:
         ref_frame: np.ndarray,
         update: bool = True,
     ) -> np.ndarray:
-        """
-        Process one frame of audio.
-
-        Args:
-            mic_frame : Microphone input d(n), shape (N,), float32/64
-            ref_frame : Reference (speaker) signal x(n), shape (N,), float32/64
-                        Must be delay-aligned before calling this method.
-            update    : If False, freeze weights (used by DTD during double-talk)
-
-        Returns:
-            e_frame : Residual after echo subtraction, shape (N,), float64
-                      This is what gets sent over the network.
-        """
-        assert mic_frame.shape == ref_frame.shape, "Frame size mismatch"
-
         N = len(mic_frame)
         L = self.cfg.filter_length
         mu = self.cfg.mu
@@ -92,47 +83,38 @@ class NLMSFilter:
         # Work in float64 for numerical stability
         mic = mic_frame.astype(np.float64)
         ref = ref_frame.astype(np.float64)
-
         e_frame = np.empty(N, dtype=np.float64)
 
+        # --- SỬA LỖI 2: Tối ưu hoá bằng strided windows ---
+        # 1. Ghép lịch sử frame trước với frame hiện tại: Độ dài = (L-1) + N
+        full_ref = np.concatenate([self._history, ref])
+        
+        # Cập nhật lịch sử cho frame tiếp theo
+        self._history[:] = full_ref[-(L - 1):]
+
+        # 2. Tạo views trượt qua mảng (không tốn thêm RAM, không cấp phát mảng con)
+        # stride_tricks trả về các cửa sổ đi tới: [x[n-L+1] ... x[n]]
+        # lật [::-1] ở chiều thứ 2 để có dạng: [x[n], x[n-1] ... x[n-L+1]]
+        X_mat = np.lib.stride_tricks.sliding_window_view(full_ref, L)[:, ::-1]
+
+        # Vòng lặp bây giờ thuần tuý là phép toán vector, triệt tiêu lệnh cấp phát/concatenate bên trong
         for n in range(N):
-            # --- Step 1: Write new reference sample into circular buffer ---
-            self._ref_buf[self._buf_idx] = ref[n]
-            self._buf_idx = (self._buf_idx + 1) % L
-
-            # --- Step 2: Extract x_vec = [x(n), x(n-1), ..., x(n-L+1)] ---
-            # Circular buffer read: most recent sample first
-            # idx_start is the position of x(n) (just written)
-            idx = (self._buf_idx - 1) % L
-            # Unroll circular buffer into contiguous vector
-            x_vec = np.concatenate([
-                self._ref_buf[idx::-1],          # x(n) down to buffer start
-                self._ref_buf[L-1:idx:-1]         # wrap around to buffer end
-            ])
-            # x_vec[0] = x(n), x_vec[1] = x(n-1), ..., x_vec[L-1] = x(n-L+1)
-
-            # --- Step 3: Echo estimate ---
+            x_vec = X_mat[n]                     # Lấy sẵn view trực tiếp O(1)
             y_n = np.dot(self.w, x_vec)          # y(n) = w^T * x_vec
-
-            # --- Step 4: Residual (this is our output for this sample) ---
             e_n = mic[n] - y_n                   # e(n) = d(n) - y(n)
             e_frame[n] = e_n
 
-            # --- Step 5: NLMS weight update (only if not double-talk) ---
             if update:
                 norm = np.dot(x_vec, x_vec) + eps
-                # Normalized step: adapts to signal level changes
                 self.w += (mu / norm) * e_n * x_vec
 
         return e_frame
 
-    def reset(self) -> None:
-        """Reset filter state. Call when starting a new call session."""
-        self.w[:] = 0.0
-        self._ref_buf[:] = 0.0
-        self._buf_idx = 0
-
     @property
     def weight_norm(self) -> float:
-        """L2 norm of current weight vector. Useful for monitoring convergence."""
+        """L2 norm of filter weights — proxy for convergence."""
         return float(np.linalg.norm(self.w))
+
+    def reset(self) -> None:
+        self.w[:] = 0.0
+        self._history[:] = 0.0

@@ -36,7 +36,7 @@ class AudioProcessor:
         mic_queue:  queue.Queue,
         ref_queue:  queue.Queue,
         send_queue: queue.Queue,
-        aec_config: AECConfig = None,
+        aec_config: AECConfig | None = None,
     ) -> None:
         self.mic_queue  = mic_queue
         self.ref_queue  = ref_queue

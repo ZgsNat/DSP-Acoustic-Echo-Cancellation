@@ -22,8 +22,15 @@ Algorithm:
     4. D = argmax(gcc_time)  within search range [0, max_delay_samples]
 """
 
-import numpy as np
+# ==========================================
+# FILE 1: delay_estimator.py
+# ==========================================
+"""
+Delay Estimator — GCC-PHAT (Generalized Cross-Correlation with Phase Transform)
+(Đã sửa lỗi đứt gãy tín hiệu bằng DelayLine Ring Buffer)
+"""
 
+import numpy as np
 
 class DelayEstimator:
     """
@@ -64,7 +71,7 @@ class DelayEstimator:
         self._acc_max = 4  # Number of frames to accumulate before estimating
 
     def update(
-        self, ref_frame: np.ndarray, mic_frame: np.ndarray
+            self, ref_frame: np.ndarray, mic_frame: np.ndarray
     ) -> int:
         """
         Feed one frame and get the current delay estimate in samples.
@@ -87,10 +94,7 @@ class DelayEstimator:
             self._ref_acc.clear()
             self._mic_acc.clear()
 
-            # Run GCC-PHAT
             raw_delay = self._gcc_phat(x, d)
-
-            # Exponential smoothing: prevents abrupt delay jumps
             self._delay_smooth = (
                 self.alpha * self._delay_smooth + (1 - self.alpha) * raw_delay
             )
@@ -115,7 +119,7 @@ class DelayEstimator:
         # PHAT weighting: normalize by magnitude → whitens the spectrum
         # This sharpens the GCC peak, making it more robust to colored noise
         magnitude = np.abs(R)
-        magnitude = np.maximum(magnitude, 1e-10)  # Avoid division by zero
+        magnitude = np.maximum(magnitude, 1e-10)
         R_phat = R / magnitude
 
         # Back to time domain
@@ -139,22 +143,43 @@ class DelayEstimator:
         return self._delay_smooth * 1000.0 / self.sr
 
 
-def apply_delay(signal: np.ndarray, delay: int) -> np.ndarray:
+# --- SỬA LỖI 1: THAY THẾ HÀM apply_delay BẰNG CLASS DelayLine ---
+# Sử dụng cơ chế Ring Buffer để đảm bảo tín hiệu reference liên tục qua các frame
+# Không bị chèn 0 và cắt xén ở mỗi frame riêng lẻ.
+class DelayLine:
     """
-    Shift signal right by `delay` samples (prepend zeros).
-
-    Used to align reference signal with microphone signal:
-        x_aligned(n) = x(n - D)
-
-    Args:
-        signal : Input signal
-        delay  : Number of samples to delay (≥ 0)
-    Returns:
-        Delayed signal, same length as input (causal: zeros prepended, end truncated)
+    Continuous Delay Line (Ring Buffer) for aligning signals.
     """
-    if delay <= 0:
-        return signal.copy()
-    delayed = np.empty_like(signal)
-    delayed[:delay] = 0.0
-    delayed[delay:] = signal[:-delay]
-    return delayed
+    def __init__(self, max_delay_samples: int = 48000) -> None:
+        # Bộ đệm đủ lớn để chứa lịch sử tín hiệu (mặc định 3s ở 16kHz)
+        self.max_delay = max_delay_samples
+        self.buffer = np.zeros(self.max_delay, dtype=np.float64)
+        self.write_idx = 0
+
+    def process(self, frame: np.ndarray, delay: int) -> np.ndarray:
+        """
+        Đẩy frame mới vào Ring Buffer và trích xuất frame trễ.
+        
+        Args:
+            frame: Tín hiệu gốc cần làm trễ (reference signal)
+            delay: Số lượng sample cần làm trễ (D >= 0)
+        """
+        N = len(frame)
+        out = np.zeros(N, dtype=np.float64)
+        delay = min(delay, self.max_delay - 1)
+        
+        for i in range(N):
+            # Ghi sample mới vào buffer
+            self.buffer[self.write_idx] = frame[i]
+            # Tính chỉ số đọc (lùi lại 'delay' mẫu)
+            read_idx = (self.write_idx - delay) % self.max_delay
+            # Lấy mẫu đã làm trễ ra ngoài
+            out[i] = self.buffer[read_idx]
+            # Cập nhật con trỏ ghi
+            self.write_idx = (self.write_idx + 1) % self.max_delay
+            
+        return out
+
+    def reset(self) -> None:
+        self.buffer[:] = 0.0
+        self.write_idx = 0

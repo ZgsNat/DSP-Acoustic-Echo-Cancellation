@@ -27,14 +27,20 @@ Limitations:
     - Geigel is simple but works well for its purpose in an AEC pipeline
 """
 
+# ==========================================
+# FILE 4: double_talk_detector.py
+# ==========================================
+"""
+Double-Talk Detector (DTD) — Geigel Algorithm
+(Đã sửa logic bộ đếm Hangover để trừ số khung (frames) thay vì số mẫu (samples))
+"""
+
 import numpy as np
 from collections import deque
-
 
 class GeigelhDTD:
     """
     Geigel Double-Talk Detector.
-
     Returns a boolean flag per frame: True = double-talk detected → freeze NLMS.
     """
 
@@ -45,47 +51,20 @@ class GeigelhDTD:
         threshold: float = 0.5,
         hangover_ms: float = 100.0,
     ) -> None:
-        """
-        Args:
-            sample_rate  : Audio sample rate in Hz
-            window_ms    : Sliding window length for max comparison (ms).
-                           Longer window = more robust, but slower response.
-            threshold    : Geigel threshold. Lower = more sensitive (more false positives).
-                           Typical: 0.5 (mic must be > 50% of speaker peak to trigger)
-            hangover_ms  : After double-talk ends, keep flag True for this long.
-                           Prevents NLMS from updating on transient tail.
-        """
+        self.sr = sample_rate
         self.threshold = threshold
+        self.hangover_ms = hangover_ms
 
         win_samples = int(window_ms * sample_rate / 1000)
-        hangover_samples = int(hangover_ms * sample_rate / 1000)
 
-        # Sliding window buffers for max tracking
         self._mic_buf: deque = deque(maxlen=win_samples)
         self._ref_buf: deque = deque(maxlen=win_samples)
 
-        # Hangover counter: stay in DT state for hangover_samples after DT ends
-        self._hangover_count: int = 0
-        self._hangover_max: int = hangover_samples
-
-        # State
+        # --- SỬA LỖI 4: Quản lý số Frames duy trì Hangover ---
+        self._hangover_frames_left: int = 0
         self._in_double_talk: bool = False
 
-    def detect(
-        self, mic_frame: np.ndarray, ref_frame: np.ndarray
-    ) -> bool:
-        """
-        Detect double-talk for this frame.
-
-        Args:
-            mic_frame : Microphone signal (near-end + echo)
-            ref_frame : Reference signal (far-end / speaker output)
-
-        Returns:
-            True if double-talk detected (NLMS should freeze)
-            False if single-talk only (NLMS can update)
-        """
-        # Update sliding window with peak absolute values from this frame
+    def detect(self, mic_frame: np.ndarray, ref_frame: np.ndarray) -> bool:
         mic_peak = float(np.max(np.abs(mic_frame)))
         ref_peak = float(np.max(np.abs(ref_frame)))
 
@@ -99,12 +78,17 @@ class GeigelhDTD:
         # Geigel criterion: near-end louder than threshold * far-end
         raw_dt = max_mic > self.threshold * (max_ref + 1e-10)
 
-        # Apply hangover: once triggered, stay True for hangover_ms
+        # --- SỬA LỖI 4: Tính chính xác số lượng Frames cần duy trì Hangover ---
+        frame_ms = (len(mic_frame) / self.sr) * 1000.0
+        hangover_frames_max = int(np.ceil(self.hangover_ms / frame_ms))
+
         if raw_dt:
-            self._hangover_count = self._hangover_max
+            # Nếu có Double-Talk thực tế, nạp lại bộ đếm số lượng frame
+            self._hangover_frames_left = hangover_frames_max
             self._in_double_talk = True
-        elif self._hangover_count > 0:
-            self._hangover_count -= len(mic_frame)
+        elif self._hangover_frames_left > 0:
+            # Nếu bộ đếm vẫn còn > 0, giảm 1 frame cho mỗi lần đi qua
+            self._hangover_frames_left -= 1
             self._in_double_talk = True
         else:
             self._in_double_talk = False
@@ -112,10 +96,9 @@ class GeigelhDTD:
         return self._in_double_talk
 
     def reset(self) -> None:
-        """Reset all state. Call at start of new session."""
         self._mic_buf.clear()
         self._ref_buf.clear()
-        self._hangover_count = 0
+        self._hangover_frames_left = 0
         self._in_double_talk = False
 
     @property

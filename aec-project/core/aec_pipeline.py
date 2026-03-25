@@ -1,3 +1,6 @@
+# ==========================================
+# FILE: aec_pipeline.py
+# ==========================================
 """
 AEC Pipeline — Main Entry Point
 
@@ -20,7 +23,8 @@ import numpy as np
 from dataclasses import dataclass
 
 from .nlms_filter import NLMSFilter, NLMSConfig
-from .delay_estimator import DelayEstimator, apply_delay
+# --- SỬA LỖI 1: Import DelayLine thay cho apply_delay ---
+from .delay_estimator import DelayEstimator, DelayLine
 from .double_talk_detector import GeigelhDTD
 from .nonlinear_suppressor import NonlinearSuppressor
 
@@ -66,6 +70,9 @@ class AECPipeline:
             sample_rate=config.sample_rate,
             max_delay_ms=config.max_delay_ms,
         )
+        # --- SỬA LỖI 1: Khởi tạo DelayLine Buffer liên tục ---
+        # Chứa tối đa 3 giây lịch sử tín hiệu ở tần số 16kHz (48000 samples)
+        self._delay_line = DelayLine(max_delay_samples=48000)
 
         # Block 2: Double-talk detector
         self._dtd = GeigelhDTD(
@@ -123,8 +130,10 @@ class AECPipeline:
         # --- Block 1: Delay estimation & alignment ---
         # Update delay estimate every few frames (amortized cost)
         delay = self._delay_est.update(ref, mic)
-        # Align reference: x_aligned(n) = x(n - D)
-        ref_aligned = apply_delay(ref, delay)
+        
+        # --- SỬA LỖI 1: Align reference sử dụng DelayLine liên tục ---
+        # Không còn bị mất dữ liệu ở đuôi hay chèn số 0 ở đầu mỗi frame riêng lẻ
+        ref_aligned = self._delay_line.process(ref, delay)
 
         # --- Block 2: Double-talk detection ---
         # Uses aligned reference for fair comparison
@@ -184,6 +193,7 @@ class AECPipeline:
 
     def reset(self) -> None:
         """Reset all internal state. Call at start of new session."""
+        self._delay_line.reset() # --- SỬA LỖI 1: Reset DelayLine ---
         self._nlms.reset()
         self._dtd.reset()
         self._nls.reset()

@@ -65,7 +65,7 @@ class AppWindow:
 
         # Connection info
         info_frame = tk.Frame(root, bg=BG)
-        info_frame.pack(fill="x", **PAD)
+        info_frame.pack(fill="x", **PAD) # type: ignore
         tk.Label(info_frame, text=f"Local port: {self._local_port}",
                  font=("Courier", 10), bg=BG, fg=FG).pack(anchor="w")
         tk.Label(info_frame, text=f"Peer: {self._peer_addr}",
@@ -97,7 +97,7 @@ class AppWindow:
 
         # ERLE meter
         metrics_frame = tk.Frame(root, bg=BG)
-        metrics_frame.pack(fill="x", **PAD)
+        metrics_frame.pack(fill="x", **PAD) # type: ignore
 
         tk.Label(metrics_frame, text="ERLE:", font=("Courier", 11, "bold"),
                  bg=BG, fg=FG, width=14, anchor="w").grid(row=0, column=0)
