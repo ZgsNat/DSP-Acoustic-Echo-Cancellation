@@ -60,24 +60,25 @@ class AECConfig:
     # 4096 taps o 16kHz = 256ms, du cho hau het phong desktop/phong hop.
     filter_length: int = 4096
 
-    # mu (step size): Gia tri lon -> hoi tu nhanh nhung misadjustment cao.
-    # 0.7 la diem can bang tot nhat cho speech: ERLE=48.5dB (echo-only),
-    # 45.9dB (truoc double-talk), 26.0dB (trong double-talk).
-    mu: float = 0.7
+    # mu (step size): 0.3 can bang giua toc do hoi tu va on dinh.
+    # 0.7 hoi tu nhanh trong test offline nhung gay divergence trong real-time
+    # vi delay estimation chua on dinh ngay → NLMS hoc sai RIR.
+    mu: float = 0.3
     eps: float = 1e-6
 
     # Delay estimation: gioi han tim kiem GCC-PHAT
     max_delay_ms: float = 300.0
 
-    # DTD: threshold 0.8 nghia la mic phai lon gap 80% ref moi bat DT.
-    # Gia tri nay cho phep NLMS cap nhat nhieu hon, hoi tu tot hon.
+    # DTD: threshold 0.8 voi cach tinh moi (energy ratio).
+    # Mic phai > (1+0.8) * echo_gain * ref = 1.8x echo du kien → DT.
     dtd_threshold: float = 0.8
     dtd_hangover_ms: float = 100.0
 
-    # NLS: alpha=3.0 over-subtraction manh, beta=0.002 san rat thap.
-    # Ket hop cho echo du gan bang 0 trong doan echo-only.
-    nls_alpha: float = 3.0
-    nls_beta: float = 0.002
+    # NLS: giam alpha tu 3.0→1.5 va tang beta tu 0.002→0.01.
+    # Alpha=3.0 qua aggressive trong real-time → gay musical noise / tieng re.
+    # Beta=0.002 san qua thap → khuech dai noise floor.
+    nls_alpha: float = 1.5
+    nls_beta: float = 0.01
 
 
 class AECPipeline:

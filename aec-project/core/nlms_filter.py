@@ -74,14 +74,12 @@ class NLMSFilter:
         self.cfg = config
         L = config.filter_length
 
-        # Vector trong so - khoi tao bang 0 (gia dinh ban dau chua co echo).
-        # Khi xu ly, w se dan hoi tu ve gia tri xap xi RIR thuc te.
         self.w: np.ndarray = np.zeros(L, dtype=np.float64)
-
-        # Buffer luu tru L-1 mau cuoi cung cua frame truoc.
-        # Can thiet de xay dung vector x(n) lien tuc qua cac frame,
-        # vi x(n) can L mau lien tiep nhung moi frame chi co N mau moi.
         self._history: np.ndarray = np.zeros(L - 1, dtype=np.float64)
+
+        # Divergence detection: theo doi residual/mic ratio qua cac frame
+        self._diverge_count: int = 0
+        self._diverge_max: int = 5  # Reset sau 5 frame phan ky lien tiep
 
     def process(
         self,
@@ -113,32 +111,39 @@ class NLMSFilter:
         e_frame = np.empty(N, dtype=np.float64)
 
         # Ghep lich su frame truoc voi frame hien tai.
-        # full_ref co do dai (L-1) + N, du de tao L cua so truot.
         full_ref = np.concatenate([self._history, ref])
 
         # Luu L-1 mau cuoi cung lam lich su cho frame tiep theo
         self._history[:] = full_ref[-(L - 1):]
 
         # Tao ma tran cac cua so truot bang stride_tricks.
-        # sliding_window_view tra ve cac cua so [x[n-L+1], ..., x[n]].
-        # Lat nguoc [:, ::-1] de co dang [x[n], x[n-1], ..., x[n-L+1]]
-        # giong nhu convolution order.
-        # Uu diem: khong cap phat bo nho moi, chi tao view len cung mang.
         X_mat = np.lib.stride_tricks.sliding_window_view(full_ref, L)[:, ::-1]
 
         for n in range(N):
-            x_vec = X_mat[n]                     # Vector reference tai mau n, O(1)
-            y_n = np.dot(self.w, x_vec)          # Echo estimate: y(n) = w^T * x(n)
-            e_n = mic[n] - y_n                   # Residual: e(n) = d(n) - y(n)
+            x_vec = X_mat[n]
+            y_n = np.dot(self.w, x_vec)
+            e_n = mic[n] - y_n
             e_frame[n] = e_n
 
             if update:
-                # Cap nhat trong so theo cong thuc NLMS.
-                # norm = ||x(n)||^2 + eps: nang luong tin hieu + regularization.
-                # Khi x lon (nguoi noi to): norm lon -> step nho -> on dinh.
-                # Khi x nho (im lang):     norm ~ eps -> gan nhu khong cap nhat.
                 norm = np.dot(x_vec, x_vec) + eps
                 self.w += (mu / norm) * e_n * x_vec
+
+        # Divergence detection: neu residual energy > mic energy →
+        # NLMS dang lam xau tin hieu thay vi cai thien
+        mic_energy = float(np.dot(mic, mic))
+        res_energy = float(np.dot(e_frame, e_frame))
+
+        if mic_energy > 1e-8 and res_energy > 1.5 * mic_energy:
+            self._diverge_count += 1
+            if self._diverge_count >= self._diverge_max:
+                # Filter da phan ky nghiem trong → reset trong so
+                self.w[:] = 0.0
+                self._diverge_count = 0
+                # Tra ve mic goc thay vi residual xau
+                e_frame[:] = mic
+        else:
+            self._diverge_count = max(0, self._diverge_count - 1)
 
         return e_frame
 
@@ -152,3 +157,4 @@ class NLMSFilter:
         """Dat lai toan bo trang thai. Goi khi bat dau phien moi."""
         self.w[:] = 0.0
         self._history[:] = 0.0
+        self._diverge_count = 0

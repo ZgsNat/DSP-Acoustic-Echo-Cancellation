@@ -32,10 +32,13 @@ import numpy as np
 
 
 class DelayEstimator:
-    """Uoc luong do tre bang GCC-PHAT.
+    """Uoc luong do tre bang GCC-PHAT voi co che on dinh.
 
     Tich luy acc_frames frame truoc khi tinh, sau do lam min pho GCC-PHAT
-    theo thoi gian. Ket qua la delay on dinh, khong bi jitter.
+    theo thoi gian. Them hysteresis de tranh nhay delay lien tuc:
+      - Chi chap nhan delay moi khi GCC peak du manh (confidence > min_confidence)
+      - Chi thay doi khi delay moi xuat hien lien tiep (confirm_count lan)
+      - Khi da lock delay, chi unlock khi peak tai delay cu yeu di ro ret
     """
 
     def __init__(
@@ -44,36 +47,35 @@ class DelayEstimator:
         max_delay_ms: float = 250.0,
         smooth_alpha: float = 0.9,
         acc_frames: int = 4,
+        min_confidence: float = 0.15,
+        confirm_count: int = 3,
     ) -> None:
         self.sr = sample_rate
-
-        # Gioi han tim kiem: chi xet delay trong khoang [0, max_delay_samples].
-        # 250ms o 16kHz = 4000 mau. Du cho hau het he thong desktop.
         self.max_delay_samples = int(max_delay_ms * sample_rate / 1000)
-
-        # He so lam min pho GCC-PHAT. Gia tri cao (0.9) -> on dinh nhung
-        # phan ung cham voi thay doi. Gia tri thap -> nhay nhung nhieu jitter.
         self.alpha = smooth_alpha
-
-        # So frame tich luy truoc khi thuc hien GCC-PHAT.
-        # Tich luy nhieu frame -> tin hieu dai hon -> peak GCC ro rang hon.
         self.acc_frames = acc_frames
 
-        # Buffer tich luy tin hieu reference va mic
+        # Hysteresis: delay moi phai dat min_confidence va xuat hien
+        # lien tiep confirm_count lan truoc khi duoc chap nhan.
+        self.min_confidence = min_confidence
+        self.confirm_count = confirm_count
+
         self._ref_acc: list[np.ndarray] = []
         self._mic_acc: list[np.ndarray] = []
-
-        # Pho GCC-PHAT da lam min (duy tri qua cac lan goi)
         self._R_phat_smooth = None
-
-        # Ket qua delay hien tai (so mau)
         self._current_delay = 0
+
+        # Hysteresis state
+        self._candidate_delay = 0
+        self._candidate_count = 0
+        self._locked = False
+        self._lock_confidence = 0.0
 
     def update(self, ref_frame: np.ndarray, mic_frame: np.ndarray) -> int:
         """Cap nhat uoc luong delay voi cap frame moi.
 
         Tich luy du acc_frames frame roi moi tinh GCC-PHAT.
-        Giua cac lan tinh, tra ve delay cu (amortized cost).
+        Ap dung hysteresis de on dinh delay.
 
         Args:
             ref_frame: Tin hieu reference shape (N,)
@@ -86,29 +88,28 @@ class DelayEstimator:
         self._mic_acc.append(mic_frame.astype(np.float64))
 
         if len(self._ref_acc) >= self.acc_frames:
-            # Noi tat ca frame da tich luy thanh tin hieu dai
             x = np.concatenate(self._ref_acc)
             d = np.concatenate(self._mic_acc)
             self._ref_acc.clear()
             self._mic_acc.clear()
 
-            # Zero-padding (2*N): bat buoc de tranh nhieu do circular correlation.
-            # Khi FFT khong co zero-pad, tuong quan vong (circular) co the tao
-            # peak gia vi tin hieu "cuon vong" dau-cuoi.
+            # Kiem tra ca ref va mic co tin hieu khong
+            # Neu mot trong hai im lang, GCC-PHAT cho ket qua vo nghia
+            ref_energy = float(np.mean(x ** 2))
+            mic_energy = float(np.mean(d ** 2))
+            if ref_energy < 1e-7 or mic_energy < 1e-7:
+                # Khong du tin hieu de uoc luong -> giu delay cu
+                return self._current_delay
+
             n_fft = 2 * len(x)
             X = np.fft.rfft(x, n=n_fft)
             D = np.fft.rfft(d, n=n_fft)
 
-            # Tinh cross-spectrum va ap dung PHAT weighting (chi giu pha)
             R = X * np.conj(D)
             magnitude = np.abs(R)
-            magnitude = np.maximum(magnitude, 1e-10)  # Tranh chia 0
+            magnitude = np.maximum(magnitude, 1e-10)
             R_phat = R / magnitude
 
-            # Lam min pho GCC-PHAT qua thoi gian.
-            # Khac voi cach lam min gia tri delay (bi nhay lien tuc),
-            # lam min truc tiep tren pho giup peak GCC dan sac net hon,
-            # va delay hoi tu ve gia tri on dinh tuyet doi (khong jitter).
             if self._R_phat_smooth is None:
                 self._R_phat_smooth = R_phat
             else:
@@ -117,12 +118,55 @@ class DelayEstimator:
                     + (1.0 - self.alpha) * R_phat
                 )
 
-            # IFFT de chuyen ve mien thoi gian -> tim peak
             gcc = np.fft.irfft(self._R_phat_smooth, n=n_fft)
 
-            # Chi tim trong khoang [0, max_delay_samples]
             search_range = gcc[:self.max_delay_samples + 1]
-            self._current_delay = int(np.argmax(search_range))
+            raw_delay = int(np.argmax(search_range))
+            peak_val = float(search_range[raw_delay])
+
+            # Confidence: peak so voi mean. Cao = peak ro rang.
+            mean_val = float(np.mean(np.abs(search_range)))
+            confidence = peak_val / (mean_val + 1e-10)
+
+            # Hysteresis logic
+            if confidence < self.min_confidence:
+                # Peak qua yeu, khong tin cay -> giu delay cu
+                pass
+            elif not self._locked:
+                # Chua lock: chap nhan delay moi neu lien tiep confirm_count lan
+                if abs(raw_delay - self._candidate_delay) <= 2:
+                    self._candidate_count += 1
+                else:
+                    self._candidate_delay = raw_delay
+                    self._candidate_count = 1
+
+                if self._candidate_count >= self.confirm_count:
+                    self._current_delay = self._candidate_delay
+                    self._locked = True
+                    self._lock_confidence = confidence
+            else:
+                # Da lock: chi thay doi khi delay moi lien tiep VA
+                # peak tai delay cu yeu di (echo path thay doi that su)
+                current_gcc_at_lock = float(search_range[
+                    min(self._current_delay, len(search_range) - 1)
+                ])
+                lock_still_good = current_gcc_at_lock > 0.5 * peak_val
+
+                if lock_still_good:
+                    # Delay cu van tot -> giu nguyen
+                    pass
+                else:
+                    # Delay cu yeu -> xem xet delay moi
+                    if abs(raw_delay - self._candidate_delay) <= 2:
+                        self._candidate_count += 1
+                    else:
+                        self._candidate_delay = raw_delay
+                        self._candidate_count = 1
+
+                    if self._candidate_count >= self.confirm_count:
+                        self._current_delay = self._candidate_delay
+                        self._lock_confidence = confidence
+                        self._candidate_count = 0
 
         return self._current_delay
 

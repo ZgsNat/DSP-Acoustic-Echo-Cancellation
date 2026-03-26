@@ -35,16 +35,20 @@ from collections import deque
 
 
 class GeigelhDTD:
-    """Geigel Double-Talk Detector.
+    """Geigel Double-Talk Detector — phien ban cai tien cho real-time.
 
-    So sanh peak mic voi peak ref (tich luy theo thoi gian) de phat hien
-    near-end speech. Ket hop voi hangover de tranh nhap nhay.
+    Van de voi Geigel goc: so sanh mic peak vs ref peak.
+    Nhung mic LUON chua echo (ban sao cua ref), nen mic peak >= ref peak
+    hau nhu moi luc → false positive rate qua cao (78% trong thuc te).
 
-    Tham so mac dinh:
-      - threshold=0.5: DT khi mic > 50% ref_max. Gia tri 0.8 duoc
-        dung trong AECConfig (cho phep nhieu hon truoc khi bat DT).
-      - echo_tail_ms=300: ref_buf phu 300ms, du cho RIR test dai nhat.
-      - hangover_ms=100: giu DT them 100ms sau khi raw_dt tat.
+    Phien ban cai tien: su dung ti so nang luong (energy ratio).
+    Mic chua echo + near_end. Echo ~= gain * ref. Neu mic >> gain * ref
+    thi co near-end. Dung RMS thay vi peak de on dinh hon.
+
+    Them co che:
+      - Uoc luong echo gain tu cac frame im lang (chi co echo)
+      - Gia tri MIN_LEVEL cao hon de tranh false positive khi im lang
+      - Hangover van duoc giu lai
     """
 
     def __init__(
@@ -59,20 +63,23 @@ class GeigelhDTD:
         self.hangover_ms = hangover_ms
         self._echo_tail_ms = echo_tail_ms
 
-        # mic_buf: chi can vai frame gan nhat (2 frame ~ 128ms o 1024@16kHz)
         self._mic_buf: deque = deque(maxlen=2)
-
-        # ref_buf: phai phu het echo tail. Tam dat maxlen=8 (~500ms),
-        # se tu dong tinh lai chinh xac o lan detect() dau tien khi biet
-        # frame_size thuc te.
         self._ref_buf: deque = deque(maxlen=8)
         self._ref_buf_configured = False
 
         self._hangover_frames_left: int = 0
         self._in_double_talk: bool = False
 
+        # Uoc luong echo gain: mic_rms / ref_rms khi chi co echo
+        # Khoi tao = 1.0 (gia dinh echo gain vua phai)
+        self._echo_gain_est: float = 1.0
+        self._echo_gain_alpha: float = 0.95  # Lam min cham
+
     def detect(self, mic_frame: np.ndarray, ref_frame: np.ndarray) -> bool:
         """Phan loai frame hien tai: co double-talk hay khong.
+
+        Phien ban cai tien: dung RMS energy ratio thay vi peak ratio.
+        Chi phat hien DT khi mic_rms vuot xa muc echo du kien.
 
         Args:
             mic_frame: Tin hieu mic shape (N,)
@@ -81,7 +88,6 @@ class GeigelhDTD:
         Returns:
             True neu dang co double-talk (pipeline nen dong bang NLMS)
         """
-        # Lan dau: tinh lai maxlen cua ref_buf dua tren frame_size thuc te
         if not self._ref_buf_configured:
             frame_ms = len(mic_frame) / self.sr * 1000.0
             ref_frames_needed = max(int(np.ceil(self._echo_tail_ms / frame_ms)), 2)
@@ -89,28 +95,43 @@ class GeigelhDTD:
             self._ref_buf = deque(old_data, maxlen=ref_frames_needed)
             self._ref_buf_configured = True
 
-        mic_peak = float(np.max(np.abs(mic_frame)))
-        ref_peak = float(np.max(np.abs(ref_frame)))
+        # Dung RMS thay vi peak — on dinh hon nhieu voi speech
+        mic_rms = float(np.sqrt(np.mean(mic_frame.astype(np.float64) ** 2)))
+        ref_rms = float(np.sqrt(np.mean(ref_frame.astype(np.float64) ** 2)))
 
-        self._mic_buf.append(mic_peak)
-        self._ref_buf.append(ref_peak)
+        self._mic_buf.append(mic_rms)
+        self._ref_buf.append(ref_rms)
 
-        max_mic = max(self._mic_buf)
-        max_ref = max(self._ref_buf)
+        max_mic_rms = max(self._mic_buf)
+        max_ref_rms = max(self._ref_buf)
 
-        # Kiem tra muc toi thieu: khi im lang (ca hai < MIN_LEVEL),
-        # ti so peak khong co y nghia -> luon tra ve False.
-        # Khong co buoc nay, ti le false positive khi im lang len toi 12%.
-        MIN_LEVEL = 1e-4
-        if max_mic < MIN_LEVEL and max_ref < MIN_LEVEL:
+        # Muc toi thieu: khi im lang, khong phat hien DT
+        MIN_LEVEL = 1e-3
+        if max_mic_rms < MIN_LEVEL and max_ref_rms < MIN_LEVEL:
+            raw_dt = False
+        elif max_ref_rms < MIN_LEVEL:
+            # Ref im lang nhung mic co tin hieu → near-end speech (khong phai DT
+            # theo nghia AEC, vi khong co echo de khu. Cho phep NLMS update
+            # de no khong bi lech).
             raw_dt = False
         else:
-            # Tieu chuan Geigel: mic lon hon threshold * ref_history
-            # thi co near-end speech. (+1e-10 de tranh chia 0)
-            raw_dt = max_mic > self.threshold * (max_ref + 1e-10)
+            # So sanh mic_rms voi echo du kien = echo_gain * ref_rms
+            # Neu mic >> echo_gain * ref → co them near-end speech
+            expected_echo = self._echo_gain_est * max_ref_rms
+            raw_dt = max_mic_rms > (1.0 + self.threshold) * expected_echo
 
-        # Hangover: giu DT them vai frame sau khi raw_dt tat,
-        # tranh NLMS cap nhat ngay lap tuc khi near-end chua noi xong.
+            # Cap nhat uoc luong echo gain khi KHONG co DT
+            # (chi khi ca ref va mic deu co tin hieu)
+            if not raw_dt and max_ref_rms > MIN_LEVEL and max_mic_rms > MIN_LEVEL:
+                current_gain = max_mic_rms / max_ref_rms
+                # Chi cap nhat khi gain hop ly (0.1 → 10)
+                if 0.1 < current_gain < 10.0:
+                    self._echo_gain_est = (
+                        self._echo_gain_alpha * self._echo_gain_est
+                        + (1.0 - self._echo_gain_alpha) * current_gain
+                    )
+
+        # Hangover
         frame_ms = (len(mic_frame) / self.sr) * 1000.0
         hangover_frames_max = int(np.ceil(self.hangover_ms / frame_ms))
 
@@ -131,6 +152,7 @@ class GeigelhDTD:
         self._ref_buf.clear()
         self._hangover_frames_left = 0
         self._in_double_talk = False
+        self._echo_gain_est = 1.0
 
     @property
     def is_double_talk(self) -> bool:

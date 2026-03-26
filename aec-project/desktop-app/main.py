@@ -46,8 +46,8 @@ def parse_args():
                    help="Headless mode (no tkinter, for testing)")
     p.add_argument("--filter-len",  type=int,   default=4096,
                    help="NLMS filter length (default: 4096)")
-    p.add_argument("--mu",          type=float, default=0.7,
-                   help="NLMS step size (default: 0.7)")
+    p.add_argument("--mu",          type=float, default=0.3,
+                   help="NLMS step size (default: 0.3)")
     p.add_argument("--diag",        type=str,   default=None,
                    help="Enable diagnostic logging to CSV file (e.g. --diag aec_debug.csv)")
     return p.parse_args()
