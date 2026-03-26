@@ -28,10 +28,13 @@ Chi goi reset() khi bat dau phien goi moi.
 
 Lich su tinh chinh (thong so mac dinh trong AECConfig):
     filter_length: 512 -> 4096 (phu het RIR 256ms o 16kHz)
-    mu:           0.1 -> 0.7  (hoi tu nhanh, ERLE tang tu ~15dB len 48dB)
-    nls_alpha:    1.5 -> 3.0  (nen echo du manh hon)
-    nls_beta:     0.05 -> 0.002 (san pho thap, output sach hon)
+    mu:           0.1 -> 0.5  (can bang toc do hoi tu va on dinh)
+    nls:          Doi tu Spectral Subtraction sang Wiener Filter Gain
+                  → khong con musical noise / tieng re
+    nls_alpha:    2.5  (over-subtraction cho Wiener gain)
+    nls_beta:     0.005 (gain floor = -46dB)
     dtd_threshold: 0.5 -> 0.8 (it bat DT nham, cho NLMS cap nhat nhieu hon)
+    Safety clamp: DA XOA — Wiener gain chi giam, khong bao gio khuech dai
 """
 
 import time
@@ -60,10 +63,10 @@ class AECConfig:
     # 4096 taps o 16kHz = 256ms, du cho hau het phong desktop/phong hop.
     filter_length: int = 4096
 
-    # mu (step size): 0.3 can bang giua toc do hoi tu va on dinh.
-    # 0.7 hoi tu nhanh trong test offline nhung gay divergence trong real-time
-    # vi delay estimation chua on dinh ngay → NLMS hoc sai RIR.
-    mu: float = 0.3
+    # mu (step size): 0.5 can bang toc do hoi tu va on dinh.
+    # 0.7 hoi tu nhanh (dung cho offline test), 0.3 qua cham.
+    # 0.5 hoat dong tot ca offline lan real-time.
+    mu: float = 0.5
     eps: float = 1e-6
 
     # Delay estimation: gioi han tim kiem GCC-PHAT
@@ -74,11 +77,11 @@ class AECConfig:
     dtd_threshold: float = 0.8
     dtd_hangover_ms: float = 100.0
 
-    # NLS: giam alpha tu 3.0→1.5 va tang beta tu 0.002→0.01.
-    # Alpha=3.0 qua aggressive trong real-time → gay musical noise / tieng re.
-    # Beta=0.002 san qua thap → khuech dai noise floor.
-    nls_alpha: float = 1.5
-    nls_beta: float = 0.01
+    # NLS: Wiener Filter Gain (thay the Spectral Subtraction).
+    # alpha=2.5: over-subtraction vua du, khong gay musical noise nho gain smoothing.
+    # beta=0.005: gain floor = -46dB, NLS co the suppress them ~46dB tren NLMS.
+    nls_alpha: float = 2.5
+    nls_beta: float = 0.005
 
 
 class AECPipeline:
@@ -170,23 +173,32 @@ class AECPipeline:
         # update=False khi double-talk -> dong bang trong so bo loc
         residual = self._nlms.process(mic, ref_aligned, update=not is_dt)
         # residual = e(n) = d(n) - w^T * x_aligned(n)
+
         self._last_residual = residual.copy()
 
-        # Khoi 4: NLS - nen echo du
+        # Khoi 4: NLS - nen echo du (Wiener Filter Gain)
         # echo_estimate = mic - residual = w^T * x_aligned (phan echo uoc luong)
+        # ref_aligned duoc truyen lam backup echo estimate cho NLS
+        # is_double_talk bao NLS bao ve near-end (tat ref backup, bypass smoothing)
         echo_estimate = mic.astype(np.float64) - residual
-        clean = self._nls.process(residual, echo_estimate)
+        clean = self._nls.process(
+            residual, echo_estimate,
+            ref_frame=ref_aligned,
+            is_double_talk=is_dt,
+        )
 
-        # Safety clamp: NLS khong duoc phep khuech dai vuot NLMS output.
-        # Van de: OLA windowing co the tao burst nhat thoi tai chuyen tiep
-        # tin hieu (vi du khi near-end ngung noi dot ngot). Burst nay lam
-        # nang luong NLS output > NLMS output -> nghe thay tieng "pop".
-        # Giai phap: neu NLS energy > NLMS energy -> dung thang NLMS output.
-        nls_energy = float(np.mean(clean.astype(np.float64) ** 2))
-        nlms_energy = float(np.mean(residual.astype(np.float64) ** 2))
+        # Post-NLS energy clamp: output khong bao gio duoc to hon mic input.
+        # Nguyen tac: pipeline chi suppress (giam), khong bao gio amplify.
+        # Vi sao can: (1) OLA overlap-add trong NLS co the de nang luong tu
+        # frame truoc (vd: DT frame co beep) tran sang frame sau (post-DT).
+        # (2) NLMS diverge sau DT → residual > mic → NLS can't fix.
+        # Clamp nhe nay chi scale xuong, khong bypass NLS.
+        clean_energy = float(np.mean(clean.astype(np.float64) ** 2))
+        mic_energy_f = float(np.mean(mic.astype(np.float64) ** 2))
         nls_bypassed = False
-        if nls_energy > nlms_energy and nlms_energy > 1e-10:
-            clean = residual.copy()
+        if clean_energy > mic_energy_f and mic_energy_f > 1e-10:
+            scale = np.sqrt(mic_energy_f / clean_energy)
+            clean = clean * scale
             nls_bypassed = True
 
         # Tich luy cong suat output de tinh ERLE
