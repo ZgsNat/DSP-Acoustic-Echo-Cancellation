@@ -11,7 +11,9 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Receives UDP audio packets, decodes PCM16 frames, and exposes frames for playback queue.
@@ -25,9 +27,12 @@ public class UdpReceiver {
     private final BlockingQueue<short[]> receiveQueue = new LinkedBlockingQueue<>(MAX_QUEUE_SIZE);
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private final AtomicLong packetsReceived = new AtomicLong(0);
+    private final AtomicLong packetsLost = new AtomicLong(0);
 
     private DatagramSocket socket;
     private Integer expectedSequence;
+    private volatile String lastError = "";
 
     public synchronized void start(int listenPort) throws IOException {
         if (running.get()) {
@@ -37,6 +42,7 @@ public class UdpReceiver {
         socket = new DatagramSocket(listenPort);
         socket.setSoTimeout(500);
         expectedSequence = null;
+        lastError = "";
         running.set(true);
 
         executor.execute(() -> {
@@ -48,7 +54,8 @@ public class UdpReceiver {
                     onPacket(packet.getData(), packet.getLength());
                 } catch (SocketTimeoutException ignored) {
                     // Timeout allows cooperative stop checks.
-                } catch (IOException ignored) {
+                } catch (IOException e) {
+                    lastError = e.getClass().getSimpleName() + ": " + safeMessage(e);
                     if (!running.get()) {
                         break;
                     }
@@ -74,6 +81,28 @@ public class UdpReceiver {
         return frame != null ? frame : new short[FRAME_SIZE];
     }
 
+    public short[] takeFrameOrSilence(long timeoutMs) {
+        try {
+            short[] frame = receiveQueue.poll(timeoutMs, TimeUnit.MILLISECONDS);
+            return frame != null ? frame : new short[FRAME_SIZE];
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new short[FRAME_SIZE];
+        }
+    }
+
+    public long getPacketsReceived() {
+        return packetsReceived.get();
+    }
+
+    public long getPacketsLost() {
+        return packetsLost.get();
+    }
+
+    public String getLastError() {
+        return lastError;
+    }
+
     private void onPacket(byte[] data, int length) {
         if (length < HEADER_SIZE) {
             return;
@@ -96,6 +125,8 @@ public class UdpReceiver {
             frame = Arrays.copyOf(frame, FRAME_SIZE);
         }
 
+        packetsReceived.incrementAndGet();
+
         if (!receiveQueue.offer(frame)) {
             receiveQueue.poll();
             receiveQueue.offer(frame);
@@ -108,6 +139,7 @@ public class UdpReceiver {
         }
         long gap = (seq - expectedSequence) & 0xFFFFFFFFL;
         if (gap > 0 && gap < 100) {
+            packetsLost.addAndGet(gap);
             for (int i = 0; i < Math.min(gap, 4); i++) {
                 short[] silence = new short[FRAME_SIZE];
                 if (!receiveQueue.offer(silence)) {
@@ -127,5 +159,10 @@ public class UdpReceiver {
             out[i] = bb.getShort();
         }
         return out;
+    }
+
+    private static String safeMessage(Exception e) {
+        String message = e.getMessage();
+        return message != null ? message : "no details";
     }
 }

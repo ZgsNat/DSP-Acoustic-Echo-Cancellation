@@ -12,6 +12,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Sends PCM16 frames over UDP with a 12-byte header compatible with desktop app.
@@ -25,6 +26,9 @@ public class UdpSender {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final AtomicInteger sequence = new AtomicInteger(0);
+    private final AtomicLong packetsSent = new AtomicLong(0);
+
+    private volatile String lastError = "";
 
     private DatagramSocket socket;
     private InetAddress peerAddress;
@@ -37,6 +41,7 @@ public class UdpSender {
         peerAddress = InetAddress.getByName(host);
         peerPort = port;
         socket = new DatagramSocket();
+        lastError = "";
         running.set(true);
 
         executor.execute(() -> {
@@ -47,8 +52,9 @@ public class UdpSender {
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     break;
-                } catch (IOException ignored) {
+                } catch (IOException e) {
                     // Network failures are tolerated; caller can inspect app status.
+                    lastError = e.getClass().getSimpleName() + ": " + safeMessage(e);
                 }
             }
         });
@@ -64,6 +70,14 @@ public class UdpSender {
             socket.close();
             socket = null;
         }
+    }
+
+    public long getPacketsSent() {
+        return packetsSent.get();
+    }
+
+    public String getLastError() {
+        return lastError;
     }
 
     public boolean enqueueFrame(short[] frame) {
@@ -94,6 +108,12 @@ public class UdpSender {
 
         DatagramPacket packet = new DatagramPacket(packetBuffer.array(), packetBuffer.array().length, peerAddress, peerPort);
         socket.send(packet);
+        packetsSent.incrementAndGet();
+    }
+
+    private static String safeMessage(Exception e) {
+        String message = e.getMessage();
+        return message != null ? message : "no details";
     }
 
     private static byte[] shortsToLittleEndianBytes(short[] frame) {

@@ -32,6 +32,19 @@
         app:layout_constraintStart_toStartOf="@id/tvTitle"
         app:layout_constraintTop_toBottomOf="@id/tvTitle" />
 
+    <TextView
+        android:id="@+id/tvLocalIp"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:text="This Device IP: detecting..."
+        android:textSize="12sp"
+        android:textStyle="italic"
+        android:textColor="@android:color/darker_gray"
+        app:layout_constraintEnd_toEndOf="@id/tvTitle"
+        app:layout_constraintStart_toStartOf="@id/tvTitle"
+        app:layout_constraintTop_toBottomOf="@id/tvSubtitle" />
+
     <com.google.android.material.textfield.TextInputLayout
         android:id="@+id/inputPeerIpLayout"
         android:layout_width="0dp"
@@ -40,7 +53,7 @@
         android:hint="Peer IP"
         app:layout_constraintEnd_toEndOf="@id/tvTitle"
         app:layout_constraintStart_toStartOf="@id/tvTitle"
-        app:layout_constraintTop_toBottomOf="@id/tvSubtitle">
+        app:layout_constraintTop_toBottomOf="@id/tvLocalIp">
 
         <com.google.android.material.textfield.TextInputEditText
             android:id="@+id/etPeerIp"
