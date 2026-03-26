@@ -44,10 +44,10 @@ def parse_args():
                    help="Peer UDP port (default: 5005)")
     p.add_argument("--no-ui",       action="store_true",
                    help="Headless mode (no tkinter, for testing)")
-    p.add_argument("--filter-len",  type=int,   default=512,
-                   help="NLMS filter length (default: 512)")
-    p.add_argument("--mu",          type=float, default=0.1,
-                   help="NLMS step size (default: 0.1)")
+    p.add_argument("--filter-len",  type=int,   default=4096,
+                   help="NLMS filter length (default: 4096)")
+    p.add_argument("--mu",          type=float, default=0.7,
+                   help="NLMS step size (default: 0.7)")
     return p.parse_args()
 
 

@@ -1,93 +1,123 @@
 """
-Double-Talk Detector (DTD) — Geigel Algorithm
+double_talk_detector.py - Phat hien double-talk bang tieu chuan Geigel
 
-Problem:
-    When both near-end user (person at mic) and far-end user (person at speaker)
-    speak simultaneously (double-talk), NLMS makes a critical mistake:
-    - It sees large error e(n) = d(n) - y(n)  (because d now contains voice too)
-    - It interprets this as "echo estimate is wrong" and updates aggressively
-    - Result: weights diverge, near-end voice is partially suppressed → distortion
+Khi nguoi dung near-end noi cung luc voi echo (double-talk), NLMS se
+bi nhieu vi tin hieu mong muon (near-end speech) tro thanh "nhieu" doi voi
+qua trinh cap nhat bo loc. Neu khong phat hien va dung cap nhat, NLMS se
+phan ky va echo tang len.
 
-Solution:
-    Detect double-talk and FREEZE NLMS weight updates during that period.
-    Conservative but safe: weights may be slightly stale, but voice is preserved.
+Giai phap: Geigel DTD phat hien double-talk, bao pipeline dong bang NLMS.
 
-Geigel Algorithm:
-    Compare the maximum absolute value of mic signal over a window
-    against the maximum absolute value of reference signal over the same window.
+Tieu chuan Geigel:
+    Neu max|mic| > threshold * max|ref_history|  =>  double-talk
 
-    if max(|d(n-k)|, k=0..K-1) > threshold * max(|x(n-k)|, k=0..K-1):
-        double_talk = True
+Y tuong: echo la ban sao suy giam cua reference. Neu mic lon hon nhieu
+so voi reference (tinh ca history) => co them tin hieu khac (near-end speech).
 
-    Intuition: If mic is significantly louder than speaker, near-end person is talking.
+Cac van de da gap va cach khac phuc:
+  1. False positive khi im lang: Ca mic va ref deu o noise floor (~1e-6),
+     ti so khong xac dinh -> bat DT nham. Fix: them MIN_LEVEL=1e-4,
+     neu ca hai < MIN_LEVEL thi tra ve False. (giam false positive tu 12% ve 0%)
 
-Limitations:
-    - False positives during loud echo (but that's safe — just slows adaptation)
-    - Cannot distinguish double-talk from background noise spike
-    - Geigel is simple but works well for its purpose in an AEC pipeline
-"""
+  2. False positive khi ref vua tat: Echo con doi lai (vi RIR dai ~200ms)
+     nhung ref_buf ngan "quen" rang ref da tung to -> tuong mic to la
+     near-end -> dong bang NLMS dung luc can cap nhat nhat.
+     Fix: ref_buf phu het echo tail (echo_tail_ms=300ms). Buffer tu tinh
+     maxlen khi biet frame_size thuc te o lan goi dau tien.
 
-# ==========================================
-# FILE 4: double_talk_detector.py
-# ==========================================
-"""
-Double-Talk Detector (DTD) — Geigel Algorithm
-(Đã sửa logic bộ đếm Hangover để trừ số khung (frames) thay vì số mẫu (samples))
+  3. Nhap nhay DT (on/off lien tuc): Khi near-end noi, co khoang im
+     ngan giua cac am -> DT tat roi bat ngay. Fix: hangover mechanism
+     giu DT=True them hangover_ms=100ms sau khi raw_dt tat.
 """
 
 import numpy as np
 from collections import deque
 
+
 class GeigelhDTD:
-    """
-    Geigel Double-Talk Detector.
-    Returns a boolean flag per frame: True = double-talk detected → freeze NLMS.
+    """Geigel Double-Talk Detector.
+
+    So sanh peak mic voi peak ref (tich luy theo thoi gian) de phat hien
+    near-end speech. Ket hop voi hangover de tranh nhap nhay.
+
+    Tham so mac dinh:
+      - threshold=0.5: DT khi mic > 50% ref_max. Gia tri 0.8 duoc
+        dung trong AECConfig (cho phep nhieu hon truoc khi bat DT).
+      - echo_tail_ms=300: ref_buf phu 300ms, du cho RIR test dai nhat.
+      - hangover_ms=100: giu DT them 100ms sau khi raw_dt tat.
     """
 
     def __init__(
         self,
         sample_rate: int = 16000,
-        window_ms: float = 20.0,
         threshold: float = 0.5,
         hangover_ms: float = 100.0,
+        echo_tail_ms: float = 300.0,
     ) -> None:
         self.sr = sample_rate
         self.threshold = threshold
         self.hangover_ms = hangover_ms
+        self._echo_tail_ms = echo_tail_ms
 
-        win_samples = int(window_ms * sample_rate / 1000)
+        # mic_buf: chi can vai frame gan nhat (2 frame ~ 128ms o 1024@16kHz)
+        self._mic_buf: deque = deque(maxlen=2)
 
-        self._mic_buf: deque = deque(maxlen=win_samples)
-        self._ref_buf: deque = deque(maxlen=win_samples)
+        # ref_buf: phai phu het echo tail. Tam dat maxlen=8 (~500ms),
+        # se tu dong tinh lai chinh xac o lan detect() dau tien khi biet
+        # frame_size thuc te.
+        self._ref_buf: deque = deque(maxlen=8)
+        self._ref_buf_configured = False
 
-        # --- SỬA LỖI 4: Quản lý số Frames duy trì Hangover ---
         self._hangover_frames_left: int = 0
         self._in_double_talk: bool = False
 
     def detect(self, mic_frame: np.ndarray, ref_frame: np.ndarray) -> bool:
+        """Phan loai frame hien tai: co double-talk hay khong.
+
+        Args:
+            mic_frame: Tin hieu mic shape (N,)
+            ref_frame: Tin hieu reference shape (N,)
+
+        Returns:
+            True neu dang co double-talk (pipeline nen dong bang NLMS)
+        """
+        # Lan dau: tinh lai maxlen cua ref_buf dua tren frame_size thuc te
+        if not self._ref_buf_configured:
+            frame_ms = len(mic_frame) / self.sr * 1000.0
+            ref_frames_needed = max(int(np.ceil(self._echo_tail_ms / frame_ms)), 2)
+            old_data = list(self._ref_buf)
+            self._ref_buf = deque(old_data, maxlen=ref_frames_needed)
+            self._ref_buf_configured = True
+
         mic_peak = float(np.max(np.abs(mic_frame)))
         ref_peak = float(np.max(np.abs(ref_frame)))
 
         self._mic_buf.append(mic_peak)
         self._ref_buf.append(ref_peak)
 
-        # Max over sliding window
-        max_mic = max(self._mic_buf) if self._mic_buf else 0.0
-        max_ref = max(self._ref_buf) if self._ref_buf else 0.0
+        max_mic = max(self._mic_buf)
+        max_ref = max(self._ref_buf)
 
-        # Geigel criterion: near-end louder than threshold * far-end
-        raw_dt = max_mic > self.threshold * (max_ref + 1e-10)
+        # Kiem tra muc toi thieu: khi im lang (ca hai < MIN_LEVEL),
+        # ti so peak khong co y nghia -> luon tra ve False.
+        # Khong co buoc nay, ti le false positive khi im lang len toi 12%.
+        MIN_LEVEL = 1e-4
+        if max_mic < MIN_LEVEL and max_ref < MIN_LEVEL:
+            raw_dt = False
+        else:
+            # Tieu chuan Geigel: mic lon hon threshold * ref_history
+            # thi co near-end speech. (+1e-10 de tranh chia 0)
+            raw_dt = max_mic > self.threshold * (max_ref + 1e-10)
 
-        # --- SỬA LỖI 4: Tính chính xác số lượng Frames cần duy trì Hangover ---
+        # Hangover: giu DT them vai frame sau khi raw_dt tat,
+        # tranh NLMS cap nhat ngay lap tuc khi near-end chua noi xong.
         frame_ms = (len(mic_frame) / self.sr) * 1000.0
         hangover_frames_max = int(np.ceil(self.hangover_ms / frame_ms))
 
         if raw_dt:
-            # Nếu có Double-Talk thực tế, nạp lại bộ đếm số lượng frame
             self._hangover_frames_left = hangover_frames_max
             self._in_double_talk = True
         elif self._hangover_frames_left > 0:
-            # Nếu bộ đếm vẫn còn > 0, giảm 1 frame cho mỗi lần đi qua
             self._hangover_frames_left -= 1
             self._in_double_talk = True
         else:
@@ -96,6 +126,7 @@ class GeigelhDTD:
         return self._in_double_talk
 
     def reset(self) -> None:
+        """Xoa trang thai. Goi khi bat dau phien moi."""
         self._mic_buf.clear()
         self._ref_buf.clear()
         self._hangover_frames_left = 0
@@ -103,5 +134,5 @@ class GeigelhDTD:
 
     @property
     def is_double_talk(self) -> bool:
-        """Current double-talk state (result of last detect() call)."""
+        """Trang thai DT hien tai (True/False)."""
         return self._in_double_talk

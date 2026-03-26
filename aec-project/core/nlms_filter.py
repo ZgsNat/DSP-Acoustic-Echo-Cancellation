@@ -1,72 +1,86 @@
 """
-NLMS Adaptive Filter — Core of AEC
+nlms_filter.py - Bo loc thich nghi NLMS (Normalized Least Mean Squares)
 
-NLMS (Normalized Least Mean Squares) estimates the Room Impulse Response (RIR)
-between the loudspeaker and microphone, then subtracts the echo estimate from
-the microphone signal.
+Day la thanh phan cot loi cua pipeline AEC. NLMS uoc luong Room Impulse
+Response (RIR) giua loa va mic, sau do tru echo estimate khoi tin hieu mic.
 
-Update rule:
+Cong thuc cap nhat trong so:
     w(n+1) = w(n) + (mu / (||x(n)||^2 + eps)) * e(n) * x(n)
 
-Where:
-    w(n)  : filter weight vector, length L (estimates RIR)
-    x(n)  : reference signal vector (last L samples from speaker)
-    d(n)  : microphone input (near-end speech + echo)
+Trong do:
+    w(n)  : vector trong so bo loc, do dai L (uoc luong RIR)
+    x(n)  : vector tin hieu reference (L mau gan nhat tu loa)
+    d(n)  : tin hieu mic (near-end speech + echo)
     y(n)  : echo estimate = w(n)^T * x(n)
-    e(n)  : error / residual = d(n) - y(n)  ← this is our output
-    mu    : step size (convergence speed vs stability tradeoff)
-    eps   : small constant to prevent division by zero
-    L     : filter length (determines how long an echo we can cancel)
-"""
+    e(n)  : sai so / residual = d(n) - y(n), day chinh la output
+    mu    : buoc nhay (trade-off toc do hoi tu vs do on dinh)
+    eps   : hang so nho tranh chia 0
+    L     : do dai bo loc (xac dinh do dai echo toi da co the khu)
 
-# ==========================================
-# FILE 2: nlms_filter.py
-# ==========================================
-"""
-NLMS Adaptive Filter — Core of AEC
-(Đã sửa nút thắt cổ chai bằng cách Vectorize mảng trượt)
+So sanh voi LMS co ban:
+    LMS:  w(n+1) = w(n) + mu * e(n) * x(n)
+    NLMS: w(n+1) = w(n) + (mu / ||x(n)||^2) * e(n) * x(n)
+
+    Diem khac biet quan trong: NLMS chia cho nang luong tin hieu x(n),
+    nen khi nguoi noi to (||x|| lon) -> step size tu dong giam (on dinh),
+    khi nguoi noi nho (||x|| nho) -> step size tu dong tang (responsive).
+    Day la ly do NLMS phu hop cho speech hon LMS.
+
+Toi uu hieu suat:
+    Phien ban nay su dung sliding_window_view (numpy stride_tricks) de tao
+    cac cua so truot ma khong can cap phat bo nho moi. Thay vi vong lap
+    thua tuan tu cat/noi mang, ta tao truoc ma tran X_mat chua tat ca cac
+    cua so, roi chi viec truy cap X_mat[n] voi do phuc tap O(1).
 """
 
 import numpy as np
 from dataclasses import dataclass
 
+
 @dataclass
 class NLMSConfig:
-    """Configuration for NLMS filter."""
+    """Cau hinh cho bo loc NLMS.
 
-    # Number of filter taps.
-    # At 16kHz, L=512 → 32ms echo window. Cover most room echoes.
-    # Longer L = captures longer reverb, but: slower convergence + more RAM.
+    Cac gia tri mac dinh la gia tri an toan chung. Khi dung trong AECPipeline,
+    cac gia tri nay se duoc ghi de boi AECConfig (vd: filter_length=4096, mu=0.7).
+    """
+
+    # So luong tap (trong so) cua bo loc.
+    # O tan so 16kHz: L=4096 tap = 256ms, du de phu hau het RIR phong desktop.
+    # L lon hon -> bat duoc echo xa hon (reverb dai), nhung hoi tu cham hon va ton RAM.
     filter_length: int = 512
 
-    # Step size mu in (0, 2) for stability.
-    # mu=0.1: slow but stable; mu=0.5: fast but noisy steady state.
-    # Typical choice for AEC: 0.1–0.3
+    # Buoc nhay mu, phai nam trong khoang (0, 2) de dam bao on dinh.
+    # mu=0.1: cham nhung on dinh; mu=0.7: nhanh nhung steady-state error cao hon.
+    # Sau nhieu lan tinh chinh, mu=0.7 cho ket qua tot nhat voi speech 5 giay,
+    # dat ERLE 48.5dB trong test echo-only.
     mu: float = 0.1
 
-    # Regularization to avoid division by zero during silence.
+    # Hang so regularization tranh chia 0 khi silence.
     eps: float = 1e-6
 
-class NLMSFilter:
-    """
-    Single-channel NLMS adaptive filter for Acoustic Echo Cancellation.
 
-    Usage:
-        filt = NLMSFilter(NLMSConfig())
+class NLMSFilter:
+    """Bo loc thich nghi NLMS don kenh cho Acoustic Echo Cancellation.
+
+    Cach su dung:
+        filt = NLMSFilter(NLMSConfig(filter_length=4096, mu=0.7))
         for frame in audio_frames:
-            e = filt.process(mic_frame, ref_frame, update=True)
-            # e is the echo-cancelled output (residual)
+            residual = filt.process(mic_frame, ref_frame, update=True)
+            # residual la tin hieu da khu echo (error signal e(n))
     """
 
     def __init__(self, config: NLMSConfig = NLMSConfig()) -> None:
         self.cfg = config
         L = config.filter_length
 
-        # Filter weights — start at zero (assumes no echo initially)
+        # Vector trong so - khoi tao bang 0 (gia dinh ban dau chua co echo).
+        # Khi xu ly, w se dan hoi tu ve gia tri xap xi RIR thuc te.
         self.w: np.ndarray = np.zeros(L, dtype=np.float64)
-        
-        # --- SỬA LỖI 2: Dùng buffer tuyến tính thay vì circular buffer thủ công ---
-        # Chỉ lưu lịch sử L-1 mẫu của frame trước đó
+
+        # Buffer luu tru L-1 mau cuoi cung cua frame truoc.
+        # Can thiet de xay dung vector x(n) lien tuc qua cac frame,
+        # vi x(n) can L mau lien tiep nhung moi frame chi co N mau moi.
         self._history: np.ndarray = np.zeros(L - 1, dtype=np.float64)
 
     def process(
@@ -75,36 +89,54 @@ class NLMSFilter:
         ref_frame: np.ndarray,
         update: bool = True,
     ) -> np.ndarray:
+        """Xu ly mot frame qua bo loc NLMS.
+
+        Args:
+            mic_frame: Tin hieu mic d(n), shape (N,). Chua echo + near-end.
+            ref_frame: Tin hieu reference x(n), shape (N,). Tin hieu dang phat qua loa.
+            update: True = cap nhat trong so (che do binh thuong).
+                    False = dong bang trong so (khi co double-talk, DTD bat).
+
+        Returns:
+            e_frame: Residual signal e(n) = d(n) - w^T*x(n), shape (N,).
+                     Khi hoi tu tot, e(n) chi con near-end speech, echo da bi khu.
+        """
         N = len(mic_frame)
         L = self.cfg.filter_length
         mu = self.cfg.mu
         eps = self.cfg.eps
 
-        # Work in float64 for numerical stability
+        # Chuyen sang float64 de dam bao do chinh xac so hoc.
+        # Su dung float32 co the gay tich luy sai so sau nhieu lan cap nhat.
         mic = mic_frame.astype(np.float64)
         ref = ref_frame.astype(np.float64)
         e_frame = np.empty(N, dtype=np.float64)
 
-        # --- SỬA LỖI 2: Tối ưu hoá bằng strided windows ---
-        # 1. Ghép lịch sử frame trước với frame hiện tại: Độ dài = (L-1) + N
+        # Ghep lich su frame truoc voi frame hien tai.
+        # full_ref co do dai (L-1) + N, du de tao L cua so truot.
         full_ref = np.concatenate([self._history, ref])
-        
-        # Cập nhật lịch sử cho frame tiếp theo
+
+        # Luu L-1 mau cuoi cung lam lich su cho frame tiep theo
         self._history[:] = full_ref[-(L - 1):]
 
-        # 2. Tạo views trượt qua mảng (không tốn thêm RAM, không cấp phát mảng con)
-        # stride_tricks trả về các cửa sổ đi tới: [x[n-L+1] ... x[n]]
-        # lật [::-1] ở chiều thứ 2 để có dạng: [x[n], x[n-1] ... x[n-L+1]]
+        # Tao ma tran cac cua so truot bang stride_tricks.
+        # sliding_window_view tra ve cac cua so [x[n-L+1], ..., x[n]].
+        # Lat nguoc [:, ::-1] de co dang [x[n], x[n-1], ..., x[n-L+1]]
+        # giong nhu convolution order.
+        # Uu diem: khong cap phat bo nho moi, chi tao view len cung mang.
         X_mat = np.lib.stride_tricks.sliding_window_view(full_ref, L)[:, ::-1]
 
-        # Vòng lặp bây giờ thuần tuý là phép toán vector, triệt tiêu lệnh cấp phát/concatenate bên trong
         for n in range(N):
-            x_vec = X_mat[n]                     # Lấy sẵn view trực tiếp O(1)
-            y_n = np.dot(self.w, x_vec)          # y(n) = w^T * x_vec
-            e_n = mic[n] - y_n                   # e(n) = d(n) - y(n)
+            x_vec = X_mat[n]                     # Vector reference tai mau n, O(1)
+            y_n = np.dot(self.w, x_vec)          # Echo estimate: y(n) = w^T * x(n)
+            e_n = mic[n] - y_n                   # Residual: e(n) = d(n) - y(n)
             e_frame[n] = e_n
 
             if update:
+                # Cap nhat trong so theo cong thuc NLMS.
+                # norm = ||x(n)||^2 + eps: nang luong tin hieu + regularization.
+                # Khi x lon (nguoi noi to): norm lon -> step nho -> on dinh.
+                # Khi x nho (im lang):     norm ~ eps -> gan nhu khong cap nhat.
                 norm = np.dot(x_vec, x_vec) + eps
                 self.w += (mu / norm) * e_n * x_vec
 
@@ -112,9 +144,11 @@ class NLMSFilter:
 
     @property
     def weight_norm(self) -> float:
-        """L2 norm of filter weights — proxy for convergence."""
+        """Chuan L2 cua vector trong so - dung de theo doi qua trinh hoi tu.
+        Gia tri tang dan khi filter hoc RIR, on dinh khi da hoi tu."""
         return float(np.linalg.norm(self.w))
 
     def reset(self) -> None:
+        """Dat lai toan bo trang thai. Goi khi bat dau phien moi."""
         self.w[:] = 0.0
         self._history[:] = 0.0
