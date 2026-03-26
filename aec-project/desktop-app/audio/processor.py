@@ -95,13 +95,19 @@ class AudioProcessor:
             except queue.Empty:
                 continue
 
-            # Get reference frame — non-blocking, use silence if unavailable
-            ref_is_silence = False
-            try:
-                ref_frame = self.ref_queue.get_nowait()
-            except queue.Empty:
-                ref_frame = silence
-                ref_is_silence = True
+            # Get reference frame — drain queue to get LATEST frame.
+            # Critical: if we only get_nowait() once, ref frames accumulate
+            # when playback callback fires faster than processor loop.
+            # Over time the ref lags behind mic by many frames, destroying
+            # NLMS correlation and making echo cancellation impossible.
+            ref_frame = silence
+            ref_is_silence = True
+            while True:
+                try:
+                    ref_frame = self.ref_queue.get_nowait()
+                    ref_is_silence = False
+                except queue.Empty:
+                    break
 
             # Apply AEC or bypass
             with self._lock:
