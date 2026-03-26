@@ -127,7 +127,11 @@ class NLMSFilter:
 
             if update:
                 norm = np.dot(x_vec, x_vec) + eps
-                self.w += (mu / norm) * e_n * x_vec
+                # Bao ve: khi ref qua yeu (norm ~ eps), step size = mu/eps
+                # co the cuc lon → filter bung no. Chi update khi ref co
+                # nang luong thuc su (norm > 100*eps).
+                if norm > 100 * eps:
+                    self.w += (mu / norm) * e_n * x_vec
 
         # Divergence detection: neu residual energy > mic energy →
         # NLMS dang lam xau tin hieu thay vi cai thien
