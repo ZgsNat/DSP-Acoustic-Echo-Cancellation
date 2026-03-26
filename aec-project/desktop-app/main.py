@@ -105,7 +105,8 @@ def main():
     # Startup sequence
     # ------------------------------------------------------------------ #
     print(f"[AEC] Starting — local port: {args.local_port}, peer: {args.peer_host}:{args.peer_port}")
-    print(f"[AEC] NLMS filter_length={args.filter_len}, mu={args.mu}")    if args.diag:
+    print(f"[AEC] NLMS filter_length={args.filter_len}, mu={args.mu}")    
+    if args.diag:
         print(f"[AEC] Diagnostic logging ENABLED \u2192 {args.diag}")
     receiver.start()   # Start listening before anything else
     playback.start()
