@@ -18,6 +18,7 @@ import os
 # Adjust path so we can import core from desktop-app context
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))
 from core.aec_pipeline import AECPipeline, AECConfig
+from core.diagnostic_logger import DiagnosticLogger
 
 
 class AudioProcessor:
@@ -37,12 +38,16 @@ class AudioProcessor:
         ref_queue:  queue.Queue,
         send_queue: queue.Queue,
         aec_config: AECConfig | None = None,
+        diagnostic_path: str | None = None,
     ) -> None:
         self.mic_queue  = mic_queue
         self.ref_queue  = ref_queue
         self.send_queue = send_queue
 
-        self._pipeline = AECPipeline(aec_config or AECConfig())
+        self._pipeline = AECPipeline(
+            aec_config or AECConfig(),
+            diagnostic_path=diagnostic_path,
+        )
         self._aec_enabled = False  # Off by default — toggled by UI
         self._lock = threading.Lock()
 
@@ -91,16 +96,19 @@ class AudioProcessor:
                 continue
 
             # Get reference frame — non-blocking, use silence if unavailable
+            ref_is_silence = False
             try:
                 ref_frame = self.ref_queue.get_nowait()
             except queue.Empty:
                 ref_frame = silence
+                ref_is_silence = True
 
             # Apply AEC or bypass
             with self._lock:
                 aec_on = self._aec_enabled
 
             if aec_on:
+                self._pipeline.mark_ref_silence(ref_is_silence)
                 output_frame = self._pipeline.process(mic_frame, ref_frame)
             else:
                 output_frame = mic_frame
@@ -116,3 +124,10 @@ class AudioProcessor:
             if aec_on and (now - self._last_metrics_time) >= self._metrics_interval:
                 self.latest_metrics = self._pipeline.get_metrics()
                 self._last_metrics_time = now
+
+    def print_diagnostic_summary(self) -> None:
+        """Print diagnostic summary. Call after stopping."""
+        diag = self._pipeline.diagnostic_logger
+        if diag is not None:
+            diag.print_summary()
+            diag.close()

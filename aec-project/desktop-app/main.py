@@ -48,6 +48,8 @@ def parse_args():
                    help="NLMS filter length (default: 4096)")
     p.add_argument("--mu",          type=float, default=0.7,
                    help="NLMS step size (default: 0.7)")
+    p.add_argument("--diag",        type=str,   default=None,
+                   help="Enable diagnostic logging to CSV file (e.g. --diag aec_debug.csv)")
     return p.parse_args()
 
 
@@ -79,6 +81,7 @@ def main():
         ref_queue  = playback.ref_queue,
         send_queue = send_queue,
         aec_config = aec_config,
+        diagnostic_path = args.diag,
     )
 
     sender   = AudioSender(send_queue, args.peer_host, args.peer_port)
@@ -102,8 +105,8 @@ def main():
     # Startup sequence
     # ------------------------------------------------------------------ #
     print(f"[AEC] Starting — local port: {args.local_port}, peer: {args.peer_host}:{args.peer_port}")
-    print(f"[AEC] NLMS filter_length={args.filter_len}, mu={args.mu}")
-
+    print(f"[AEC] NLMS filter_length={args.filter_len}, mu={args.mu}")    if args.diag:
+        print(f"[AEC] Diagnostic logging ENABLED \u2192 {args.diag}")
     receiver.start()   # Start listening before anything else
     playback.start()
     capture.start()
@@ -127,6 +130,8 @@ def main():
         sender.stop()
         receiver.stop()
         processor.stop()
+        # Print diagnostic summary before closing audio devices
+        processor.print_diagnostic_summary()
         capture.stop()
         playback.stop()
         print("[AEC] Done.")

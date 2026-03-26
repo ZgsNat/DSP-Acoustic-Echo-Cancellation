@@ -34,6 +34,7 @@ Lich su tinh chinh (thong so mac dinh trong AECConfig):
     dtd_threshold: 0.5 -> 0.8 (it bat DT nham, cho NLMS cap nhat nhieu hon)
 """
 
+import time
 import numpy as np
 from dataclasses import dataclass
 
@@ -41,6 +42,7 @@ from .nlms_filter import NLMSFilter, NLMSConfig
 from .delay_estimator import DelayEstimator, DelayLine
 from .double_talk_detector import GeigelhDTD
 from .nonlinear_suppressor import NonlinearSuppressor
+from .diagnostic_logger import DiagnosticLogger, FrameMetrics
 
 
 @dataclass
@@ -84,8 +86,13 @@ class AECPipeline:
     Khong thread-safe. Goi tu mot audio thread duy nhat.
     """
 
-    def __init__(self, config: AECConfig = AECConfig()) -> None:
+    def __init__(self, config: AECConfig = AECConfig(), diagnostic_path: str | None = None) -> None:
         self.cfg = config
+
+        # Diagnostic logger (None = disabled, string = CSV path)
+        self._diag: DiagnosticLogger | None = None
+        if diagnostic_path:
+            self._diag = DiagnosticLogger(diagnostic_path)
 
         # Khoi 1: Uoc luong do tre (GCC-PHAT)
         self._delay_est = DelayEstimator(
@@ -142,6 +149,7 @@ class AECPipeline:
         """
         mic = mic_frame.astype(np.float32)
         ref = ref_frame.astype(np.float32)
+        t_start = time.perf_counter()
 
         # Tich luy cong suat mic de tinh ERLE sau
         self._mic_power_acc.append(float(np.mean(mic ** 2)))
@@ -175,11 +183,44 @@ class AECPipeline:
         # Giai phap: neu NLS energy > NLMS energy -> dung thang NLMS output.
         nls_energy = float(np.mean(clean.astype(np.float64) ** 2))
         nlms_energy = float(np.mean(residual.astype(np.float64) ** 2))
+        nls_bypassed = False
         if nls_energy > nlms_energy and nlms_energy > 1e-10:
             clean = residual.copy()
+            nls_bypassed = True
 
         # Tich luy cong suat output de tinh ERLE
         self._out_power_acc.append(float(np.mean(clean.astype(np.float32) ** 2)))
+
+        # Diagnostic logging
+        if self._diag is not None:
+            mic_rms = float(np.sqrt(np.mean(mic.astype(np.float64) ** 2)))
+            ref_rms = float(np.sqrt(np.mean(ref.astype(np.float64) ** 2)))
+            res_rms = float(np.sqrt(np.mean(residual.astype(np.float64) ** 2)))
+            echo_est_rms = float(np.sqrt(np.mean(echo_estimate ** 2)))
+            out_rms = float(np.sqrt(np.mean(clean.astype(np.float64) ** 2)))
+            erle_inst = 10.0 * np.log10(mic_rms**2 / (out_rms**2 + 1e-10)) if mic_rms > 1e-6 else 0.0
+            t_elapsed = (time.perf_counter() - t_start) * 1000
+
+            m = FrameMetrics(
+                frame_idx=self._frame_count,
+                timestamp=time.time(),
+                mic_rms=mic_rms,
+                mic_peak=float(np.max(np.abs(mic))),
+                ref_rms=ref_rms,
+                ref_peak=float(np.max(np.abs(ref))),
+                ref_is_silence=getattr(self, '_last_ref_was_silence', False),
+                delay_samples=delay,
+                delay_ms=delay * 1000.0 / self.cfg.sample_rate,
+                is_double_talk=is_dt,
+                nlms_residual_rms=res_rms,
+                echo_est_rms=echo_est_rms,
+                nls_output_rms=out_rms,
+                nls_bypassed=nls_bypassed,
+                erle_instant_db=float(erle_inst),
+                filter_norm=self._nlms.weight_norm,
+                process_time_ms=t_elapsed,
+            )
+            self._diag.log(m)
 
         return clean.astype(np.float32)
 
@@ -215,6 +256,14 @@ class AECPipeline:
         self._frame_count = 0
 
         return metrics
+
+    def mark_ref_silence(self, is_silence: bool) -> None:
+        """AudioProcessor goi de bao ref_queue empty."""
+        self._last_ref_was_silence = is_silence
+
+    @property
+    def diagnostic_logger(self) -> DiagnosticLogger | None:
+        return self._diag
 
     def reset(self) -> None:
         """Reset toan bo trang thai. Goi khi bat dau phien goi moi."""
