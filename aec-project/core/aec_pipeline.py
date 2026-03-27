@@ -270,6 +270,26 @@ class AECPipeline:
 
         return metrics
 
+    def feed_reference(self, ref_frame: np.ndarray) -> None:
+        """Nap ref frame trung gian vao delay line va NLMS history.
+
+        Khi playback callback chay nhanh hon processor loop, co nhieu
+        ref frame cho moi mic frame. Cac ref frame trung gian (khong co
+        mic tuong ung) PHAI duoc nap vao day de:
+          - DelayLine: ring buffer lien tuc, khong co lo hong
+          - NLMS._history: lich su reference khop voi thuc te loa phat
+
+        Neu khong goi ham nay, ref_aligned se sai lech → NLMS mat
+        tuong quan → KHONG the triet echo.
+
+        Args:
+            ref_frame: Reference frame shape (frame_size,), float32.
+        """
+        ref = ref_frame.astype(np.float32)
+        delay = self._delay_est.current_delay_samples
+        ref_aligned = self._delay_line.process(ref, delay)
+        self._nlms.feed_reference(ref_aligned)
+
     def mark_ref_silence(self, is_silence: bool) -> None:
         """AudioProcessor goi de bao ref_queue empty."""
         self._last_ref_was_silence = is_silence

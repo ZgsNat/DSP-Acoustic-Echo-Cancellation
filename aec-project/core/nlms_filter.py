@@ -157,6 +157,21 @@ class NLMSFilter:
         Gia tri tang dan khi filter hoc RIR, on dinh khi da hoi tu."""
         return float(np.linalg.norm(self.w))
 
+    def feed_reference(self, ref_frame: np.ndarray) -> None:
+        """Cap nhat lich su reference ma khong chay bo loc.
+
+        Goi khi co ref frame trung gian (playback callback nhanh hon
+        processor loop). Giu cho _history lien tuc, tranh lo hong
+        khien NLMS mat tuong quan o frame tiep theo.
+
+        Args:
+            ref_frame: Tin hieu reference shape (N,), float.
+        """
+        ref = ref_frame.astype(np.float64)
+        L = self.cfg.filter_length
+        full_ref = np.concatenate([self._history, ref])
+        self._history[:] = full_ref[-(L - 1):]
+
     def reset(self) -> None:
         """Dat lai toan bo trang thai. Goi khi bat dau phien moi."""
         self.w[:] = 0.0

@@ -93,7 +93,14 @@ class AudioPlayback:
         try:
             self.ref_queue.put_nowait(frame.copy())
         except queue.Full:
-            pass  # AEC degrades gracefully without latest ref frame
+            # Drop oldest to keep ref_queue fresh (same as mic_queue)
+            # Dropping newest would cause AEC to lose the most recent
+            # reference, breaking NLMS correlation
+            try:
+                self.ref_queue.get_nowait()
+                self.ref_queue.put_nowait(frame.copy())
+            except queue.Empty:
+                pass
 
         pcm = (np.clip(frame, -1.0, 1.0) * 32767).astype(DTYPE)
         return (pcm.tobytes(), pyaudio.paContinue)

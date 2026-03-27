@@ -87,6 +87,10 @@ class AudioProcessor:
         """Processing loop. Runs until stop() is called."""
         # Silence frame used when ref_queue is empty (speaker playing nothing)
         silence = np.zeros(1024, dtype=np.float32)
+        # Last known reference — used when ref_queue is temporarily empty.
+        # Much better than silence: echo of the previous frame is still
+        # bouncing in the room, so AEC needs a non-zero reference.
+        last_ref = silence.copy()
 
         while not self._stop_event.is_set():
             # Block waiting for mic frame (with timeout to check stop_event)
@@ -95,24 +99,40 @@ class AudioProcessor:
             except queue.Empty:
                 continue
 
-            # Get reference frame — drain queue to get LATEST frame.
-            # Critical: if we only get_nowait() once, ref frames accumulate
-            # when playback callback fires faster than processor loop.
-            # Over time the ref lags behind mic by many frames, destroying
-            # NLMS correlation and making echo cancellation impossible.
-            ref_frame = silence
-            ref_is_silence = True
+            # Collect ALL reference frames from the queue.
+            # Both PyAudio streams run at the same sample rate on the same
+            # sound card, so usually there's exactly 1 ref per 1 mic frame.
+            # Scheduling jitter can occasionally produce 0 or 2+.
+            ref_frames = []
             while True:
                 try:
-                    ref_frame = self.ref_queue.get_nowait()
-                    ref_is_silence = False
+                    ref_frames.append(self.ref_queue.get_nowait())
                 except queue.Empty:
                     break
 
-            # Apply AEC or bypass
             with self._lock:
                 aec_on = self._aec_enabled
 
+            if len(ref_frames) == 0:
+                # No new ref — use last known frame (NOT silence).
+                # The speaker was still playing the previous frame's audio;
+                # its echo is still present in the room. Feeding silence
+                # would make NLMS see a large error → weight divergence.
+                ref_frame = last_ref
+                ref_is_silence = np.max(np.abs(ref_frame)) < 1e-6
+            else:
+                # Feed intermediate ref frames through pipeline's delay line
+                # and NLMS history so their buffers stay continuous.
+                # Without this, skipped refs create gaps in the ring buffer
+                # → ref_aligned is wrong → NLMS can't correlate → no cancel.
+                if aec_on and len(ref_frames) > 1:
+                    for intermediate_ref in ref_frames[:-1]:
+                        self._pipeline.feed_reference(intermediate_ref)
+                ref_frame = ref_frames[-1]
+                last_ref = ref_frame.copy()
+                ref_is_silence = False
+
+            # Apply AEC or bypass
             if aec_on:
                 self._pipeline.mark_ref_silence(ref_is_silence)
                 output_frame = self._pipeline.process(mic_frame, ref_frame)
