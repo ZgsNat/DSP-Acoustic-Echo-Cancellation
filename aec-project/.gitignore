@@ -2,3 +2,12 @@
 __pycache__
 *.pyc
 pytest_cache
+
+# Android Studio
+.idea/
+*.iml
+.gradle/
+local.properties
+
+# Build
+/build/
