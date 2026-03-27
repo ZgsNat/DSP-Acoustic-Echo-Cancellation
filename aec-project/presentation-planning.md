@@ -67,7 +67,7 @@ Mic d(n) ---------------------------------------------------->[Bộ lọc NLMS]-
                            (Thuật toán Geigel)                                |
                                                                               v
                                                                     [Bộ triệt phi tuyến]
-                                                                    (Spectral Subtraction)
+                                                                    (Wiener Filter Gain)
                                                                               |
                                                                               v
                                                                          Đầu ra sạch
@@ -105,10 +105,10 @@ Tại mỗi mẫu $n$:
 | Tham số | Giá trị mặc định | Giá trị đã tinh chỉnh | Ghi chú |
 |---------|-------------------|----------------------|---------|
 | `filter_length` L | 512 (32ms) | **4096 (256ms)** | Phủ hết RIR dài 250ms. 512 quá ngắn, bỏ sót echo xa. |
-| `mu` | 0.1 | **0.7** | Hội tụ nhanh trên giọng nói. Kết quả: ERLE 48.5dB (chỉ có echo). |
+| `mu` | 0.1 | **0.5** (real-time) / **0.7** (offline test) | 0.5 cân bằng hội tụ nhanh và ổn định cho real-time. 0.7 cho offline test đạt ERLE 48.5dB. |
 | `eps` | $10^{-6}$ | $10^{-6}$ | Không thay đổi, chỉ để tránh chia cho 0. |
 
-**Lý do tăng mu từ 0.1 lên 0.7**: Giọng nói là tín hiệu không dừng (non-stationary), thay đổi nhanh. $\mu$ nhỏ (0.1) hội tụ quá chậm, chưa kịp bắt kịp RIR thì giọng nói đã thay đổi. $\mu = 0.7$ hội tụ trong khoảng 50ms, đủ nhanh để bắt kịp mọi âm tiết.
+**Lý do tăng mu từ 0.1 lên 0.5-0.7**: Giọng nói là tín hiệu không dừng (non-stationary), thay đổi nhanh. $\mu$ nhỏ (0.1) hội tụ quá chậm, chưa kịp bắt kịp RIR thì giọng nói đã thay đổi. $\mu = 0.5$ (real-time) hội tụ trong khoảng 80ms, đủ nhanh và ổn định cho cuộc gọi thực. $\mu = 0.7$ (offline) hội tụ nhanh hơn (~50ms) nhưng steady-state error cao hơn, phù hợp cho demo ngắn.
 
 **Tối ưu hóa (stride_tricks)**: Thay vì dùng vòng lặp `for` chạy từng mẫu (chậm trong Python), chúng tôi dùng `np.lib.stride_tricks.as_strided` để tạo ma trận Toeplitz rồi nhân ma trận. Tốc độ tăng gấp ~50 lần, đủ nhanh cho xử lý thời gian thực ở 16kHz.
 
@@ -153,12 +153,22 @@ Trọng số PHAT làm cho đỉnh (peak) nhọn hơn so với tương quan ché
 
 ## 7. Bộ triệt phi tuyến (Nonlinear Suppressor - Post-filter)
 
-Sau NLMS, vẫn còn echo dư (residual) do méo phi tuyến hoặc sai số ước lượng. Chúng tôi dùng phương pháp **Spectral Subtraction** kết hợp với **Overlap-Add (OLA)**.
+Sau NLMS, vẫn còn echo dư (residual) do méo phi tuyến hoặc sai số ước lượng. Chúng tôi dùng phương pháp **Wiener Filter Gain** kết hợp với **Overlap-Add (OLA)**.
 
-### Công thức trừ phổ
-$$|E_{clean}(f)|^2 = max(|E(f)|^2 - \alpha \cdot |Y_{smooth}(f)|^2, \beta \cdot |E(f)|^2)$$
-- $\alpha$: Hệ số trừ quá mức (càng lớn triệt càng mạnh).
-- $\beta$: Sàn phổ (spectral floor) để tránh nhiễu âm thanh (musical noise).
+### Tại sao đổi từ Spectral Subtraction sang Wiener Filter Gain?
+Spectral Subtraction ban đầu gây **musical noise** (tiếng rè, tiếng kim loại) do các bin tần số dao động giữa 0 và giá trị lớn. Wiener Filter Gain khắc phục bằng cách dùng hệ số gain mượt thay vì trừ phổ trực tiếp.
+
+### Công thức Wiener Filter Gain
+$$G(f) = max\left(1 - \alpha \cdot \frac{|Echo_{smooth}(f)|^2}{|E(f)|^2 + \epsilon}, \beta\right)$$
+$$E_{clean}(f) = G(f) \cdot E(f)$$
+- $\alpha = 2.5$: Hệ số over-subtraction (triệt mạnh hơn echo ước lượng).
+- $\beta = 0.005$: Gain floor = $-46$dB, NLS có thể suppress thêm ~46dB trên NLMS.
+- $G(f)$ luôn trong khoảng $[\beta, 1]$ → **chỉ giảm, không bao giờ khuếch đại** → không gây musical noise.
+
+### Kỹ thuật làm mượt Gain
+- **Gain smoothing bất đối xứng**: Attack nhanh ($\alpha_{attack} = 0.1$), release chậm ($\alpha_{release} = 0.85$). Echo xuất hiện → suppress ngay lập tức; echo biến mất → mở gain từ từ, tránh tiếng lách tách.
+- **Frequency smoothing**: Trung bình có trọng số 3-bin liền kề, tránh gain nhảy giữa hai bin cạnh nhau.
+- **Double-talk bypass**: Khi DTD phát hiện double-talk, NLS **bypass hoàn toàn** (trả về residual từ NLMS trực tiếp, không qua OLA). Buffer OLA được reset để tránh tràn năng lượng khi chuyển trạng thái.
 
 **Cửa sổ Overlap-Add (OLA)**: Sử dụng cửa sổ Hann và chồng lấp 50% giữa các khung hình để tránh hiện tượng tiếng lách tách (click/pop) ở biên mỗi khung.
 
@@ -168,7 +178,8 @@ $$|E_{clean}(f)|^2 = max(|E(f)|^2 - \alpha \cdot |Y_{smooth}(f)|^2, \beta \cdot 
 
 | Chỉ số | Mục tiêu | Đạt được | Đánh giá |
 |--------|----------|----------|----------|
-| ERLE (Chỉ có echo) | >= 15 dB | **48.5 dB** | Vượt xa mục tiêu |
+| ERLE (Chỉ có echo, offline) | >= 15 dB | **48.5 dB** (mu=0.7) | Vượt xa mục tiêu |
+| ERLE (Echo-only, real-time pipeline) | >= 15 dB | ~**40+ dB** (mu=0.5) | Đủ tốt cho cuộc gọi |
 | Triệt echo (Khi nói đồng thời) | >= 10 dB | **26.0 dB** | Tốt |
 | Độ méo giọng người dùng | < 3 dB | **0.6 dB** | Rất tốt |
 
@@ -187,19 +198,45 @@ $$|E_{clean}(f)|^2 = max(|E(f)|^2 - \alpha \cdot |Y_{smooth}(f)|^2, \beta \cdot 
 - NLMS có độ phức tạp $O(L)$, kết hợp với hậu xử lý NLS là đã đủ tốt.
 
 ### "Chốt chặn an toàn (Safety clamp) hoạt động như thế nào?"
-Khi năng lượng đầu ra của bộ NLS lớn hơn năng lượng sau NLMS (do lỗi nhất thời của OLA), hệ thống tự động sử dụng kết quả từ NLMS để đảm bảo không bao giờ khuếch đại tín hiệu sai lệch.
+Khi năng lượng đầu ra sau NLS lớn hơn năng lượng **mic gốc** (do OLA tràn năng lượng từ frame trước hoặc NLMS phân kỳ sau double-talk), hệ thống tự động scale output xuống bằng mức mic. Nguyên tắc: pipeline **chỉ suppress (giảm), không bao giờ amplify (khuếch đại)** so với tín hiệu mic đầu vào.
 
 ---
 
 ## 10. Luồng toàn hệ thống (E2E Flow)
 
-1. **Loa phát**: Âm thanh từ đầu xa được phát ra loa và đồng thời đưa vào bộ đệm tham chiếu.
+### 10.1 Kiến trúc đa luồng (Threading Architecture)
+Mỗi Node (máy tính) chạy 5 luồng độc lập, giao tiếp qua hàng đợi (Queue):
+
+```
+Luồng 1: UDP Receiver ──→ play_queue ──→ Luồng 2: Playback Callback ──→ Loa
+                                              │
+                                              └──→ ref_queue (tham chiếu cho AEC)
+                                                        │
+Luồng 3: Mic Capture Callback ──→ mic_queue ──→ Luồng 4: AEC Processor ──→ send_queue ──→ Luồng 5: UDP Sender
+```
+
+### 10.2 Xử lý tín hiệu tham chiếu (Reference Signal Flow)
+Điểm then chốt: Playback callback và Mic callback là hai PyAudio stream độc lập. Do scheduling jitter, số lượng ref frame và mic frame có thể không khớp 1:1 tại mỗi chu kỳ xử lý.
+
+**Giải pháp: Intermediate Reference Feeding**
+- Processor thu thập **tất cả** ref frames có trong queue (thường 1, đôi khi 0 hoặc 2+).
+- Nếu có nhiều hơn 1 ref frame: các frame trung gian (intermediate) được **nạp qua `feed_reference()`** vào DelayLine (ring buffer) và NLMS history, đảm bảo chuỗi reference liên tục.
+- Frame cuối cùng được dùng để chạy `pipeline.process()` cùng mic frame.
+- Nếu không có ref frame nào: dùng **ref frame gần nhất** (không dùng silence, vì echo từ loa vẫn đang dội trong phòng).
+
+**Tại sao cần thiết?** Nếu bỏ qua ref frame trung gian:
+- DelayLine (ring buffer) có lỗ hổng → `ref_aligned` sai lệch.
+- NLMS `_history` mất mẫu → tương quan chéo bị phá → bộ lọc **không thể hội tụ** → echo hoàn toàn không bị triệt.
+
+### 10.3 Pipeline xử lý tín hiệu (mỗi frame)
+1. **Loa phát**: Âm thanh từ đầu xa được phát ra loa. Playback callback đồng thời đẩy bản sao vào `ref_queue` (tham chiếu trước D/A, sạch hơn thu lại từ mic).
 2. **Mic thu**: Thu hỗn hợp giọng người nói gần và tiếng vọng.
-3. **Căn chỉnh**: GCC-PHAT tìm độ trễ và căn khớp tín hiệu tham chiếu với mic.
-4. **DTD**: Kiểm tra xem người dùng tại chỗ có đang nói không. Nếu có, dừng cập nhật bộ lọc.
+3. **Căn chỉnh**: GCC-PHAT tìm độ trễ $D$ và căn khớp tín hiệu tham chiếu với mic qua DelayLine (ring buffer).
+4. **DTD**: Kiểm tra xem người dùng tại chỗ có đang nói không. Nếu có, đóng băng cập nhật bộ lọc NLMS.
 5. **NLMS**: Ước lượng và trừ đi thành phần echo tuyến tính.
-6. **NLS**: Triệt tiêu các thành phần phi tuyến và echo dư còn sót lại.
-7. **Đầu ra**: Tín hiệu sạch được mã hóa và gửi qua mạng.
+6. **NLS (Wiener Filter Gain)**: Triệt tiêu các thành phần phi tuyến và echo dư còn sót lại. Bypass hoàn toàn khi double-talk.
+7. **Safety clamp**: Đảm bảo output không to hơn mic gốc.
+8. **Đầu ra**: Tín hiệu sạch được mã hóa int16 và gửi qua UDP tới Node kia.
 
 ---
 
